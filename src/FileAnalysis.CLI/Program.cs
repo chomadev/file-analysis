@@ -455,7 +455,16 @@ applyCleanupCommand.SetAction(async (ParseResult parseResult, CancellationToken 
     }
     else
     {
-        var single = await repo.GetByIdOrPrefixAsync(id!, ct);
+        CleanupSuggestion? single;
+        try
+        {
+            single = await repo.GetByIdOrPrefixAsync(id!, ct);
+        }
+        catch (InvalidOperationException ex)
+        {
+            Console.Error.WriteLine($"Error: {ex.Message}");
+            return;
+        }
         if (single is null)
         {
             Console.Error.WriteLine("Suggestion not found.");

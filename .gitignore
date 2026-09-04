@@ -10,3 +10,6 @@ appsettings.Development.json
 
 # Cleanup quarantine (holds moved user files, not project code)
 quarantine/
+
+# Claude Code local session settings (machine-specific, not shared)
+.claude/settings.local.json

@@ -1,3 +1,4 @@
+using FileAnalysis.Core;
 using FileAnalysis.Core.Interfaces;
 using FileAnalysis.Core.Models;
 using FileAnalysis.Core.Options;
@@ -66,7 +67,7 @@ public class CleanupSuggestionService(ICleanupSuggestionRepository repository, I
         {
             if (createdItems.Count >= _options.MaxCandidatesPerRun)
                 break;
-            if (pathFilter is not null && !dup.Path.StartsWith(pathFilter, StringComparison.OrdinalIgnoreCase))
+            if (pathFilter is not null && !dup.Path.StartsWith(pathFilter, PathComparison.Comparison))
                 continue;
 
             var keeperPath = pathsById.GetValueOrDefault(dup.KeeperFileId, dup.KeeperFileId.ToString());
@@ -89,7 +90,7 @@ public class CleanupSuggestionService(ICleanupSuggestionRepository repository, I
 
             if (!pathsById.TryGetValue(fileId, out var filePath))
                 continue; // file no longer exists
-            if (pathFilter is not null && !filePath.StartsWith(pathFilter, StringComparison.OrdinalIgnoreCase))
+            if (pathFilter is not null && !filePath.StartsWith(pathFilter, PathComparison.Comparison))
                 continue;
 
             var candidatePath = pathsById.GetValueOrDefault(candidateFileId, candidateFileId.ToString());

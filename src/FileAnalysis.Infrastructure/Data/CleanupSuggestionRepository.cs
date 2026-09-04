@@ -1,3 +1,4 @@
+using FileAnalysis.Core;
 using FileAnalysis.Core.Interfaces;
 using FileAnalysis.Core.Models;
 using FileAnalysis.Infrastructure.Cleanup;
@@ -117,7 +118,11 @@ public class CleanupSuggestionRepository(FileAnalysisDbContext db) : ICleanupSug
     {
         var query = db.Files.AsNoTracking().AsQueryable();
         if (!string.IsNullOrWhiteSpace(pathPrefix))
-            query = query.Where(f => f.Path.StartsWith(pathPrefix));
+        {
+            query = PathComparison.IsCaseInsensitive
+                ? query.Where(f => f.Path.ToLower().StartsWith(pathPrefix.ToLower()))
+                : query.Where(f => f.Path.StartsWith(pathPrefix));
+        }
 
         // Push the LowUsefulness/Stale threshold check into the query so we only ever pull rows that can
         // actually produce a suggestion, instead of loading every indexed file and filtering in C#.
@@ -216,7 +221,11 @@ public class CleanupSuggestionRepository(FileAnalysisDbContext db) : ICleanupSug
         if (status is not null)
             query = query.Where(s => s.Status == status);
         if (!string.IsNullOrWhiteSpace(pathPrefix))
-            query = query.Where(s => s.File!.Path.StartsWith(pathPrefix));
+        {
+            query = PathComparison.IsCaseInsensitive
+                ? query.Where(s => s.File!.Path.ToLower().StartsWith(pathPrefix.ToLower()))
+                : query.Where(s => s.File!.Path.StartsWith(pathPrefix));
+        }
 
         return await query.OrderBy(s => s.SuggestedAt).ToListAsync(ct);
     }
@@ -227,7 +236,11 @@ public class CleanupSuggestionRepository(FileAnalysisDbContext db) : ICleanupSug
         if (reasonFilter is not null)
             query = query.Where(s => s.Reason == reasonFilter);
         if (!string.IsNullOrWhiteSpace(pathPrefix))
-            query = query.Where(s => s.File!.Path.StartsWith(pathPrefix));
+        {
+            query = PathComparison.IsCaseInsensitive
+                ? query.Where(s => s.File!.Path.ToLower().StartsWith(pathPrefix.ToLower()))
+                : query.Where(s => s.File!.Path.StartsWith(pathPrefix));
+        }
 
         var items = await query.ToListAsync(ct);
         foreach (var item in items)

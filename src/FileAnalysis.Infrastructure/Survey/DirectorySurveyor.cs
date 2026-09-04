@@ -26,9 +26,10 @@ public class DirectorySurveyor(
         var walked = DirectorySurveyWalker.Walk(rootPath, _scannerOptions.ExcludePatterns, _options.MaxDepth);
 
         // Bulk-preload every previously-surveyed entry under this root in one round trip instead of a
-        // per-directory GetByPathAsync lookup. Ordinal comparer matches the DB's exact-match semantics.
+        // per-directory GetByPathAsync lookup. PathComparison.Comparer matches ListByRootAsync/UpsertAsync's
+        // OS-appropriate case (in)sensitivity — see PathComparison's doc comment.
         var existingByPath = (await repository.ListByRootAsync(rootPath, ct))
-            .ToDictionary(e => e.Path, StringComparer.Ordinal);
+            .ToDictionary(e => e.Path, FileAnalysis.Core.PathComparison.Comparer);
 
         var autoExcluded = new List<DirectorySurveyEntry>();
         var needsConfirmation = new List<DirectorySurveyEntry>();

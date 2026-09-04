@@ -34,7 +34,7 @@ public class FileScanner(
         // a per-file GetByPathAsync query. AsNoTracking projection only — see GetScanMetadataAsync's doc
         // comment for why tracked entities would make later SaveChanges calls go quadratic.
         var existingByPath = dryRun
-            ? new Dictionary<string, FileScanMetadata>(StringComparer.Ordinal)
+            ? new Dictionary<string, FileScanMetadata>(FileAnalysis.Core.PathComparison.Comparer)
             : await repository.GetScanMetadataAsync(rootPath, ct);
 
         foreach (var filePath in EnumerateFiles(rootPath, excludedPaths))

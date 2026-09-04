@@ -46,7 +46,10 @@ public class OfficeExtractor : IContentExtractor
         using var doc = SpreadsheetDocument.Open(filePath, false);
         var workbook = doc.WorkbookPart;
         if (workbook is null) return null;
-        var sharedStrings = workbook.SharedStringTablePart?.SharedStringTable;
+        // Materialize once per file — SharedStringTable is an IEnumerable, not indexable, so repeated
+        // .ElementAt(idx) calls inside this nested loop would walk it from the start every time.
+        var strings = workbook.SharedStringTablePart?.SharedStringTable
+            ?.Elements<DocumentFormat.OpenXml.Spreadsheet.SharedStringItem>().ToArray();
         var sb = new System.Text.StringBuilder();
         foreach (var sheet in workbook.WorksheetParts)
         {
@@ -58,7 +61,7 @@ public class OfficeExtractor : IContentExtractor
                 {
                     if (c.DataType?.Value == DocumentFormat.OpenXml.Spreadsheet.CellValues.SharedString
                         && int.TryParse(c.InnerText, out var idx))
-                        return sharedStrings?.ElementAt(idx).InnerText ?? string.Empty;
+                        return strings?[idx].InnerText ?? string.Empty;
                     return c.InnerText;
                 });
                 sb.AppendLine(string.Join("\t", values));

@@ -31,8 +31,20 @@ public class AnalysisService(
         if (file is null)
             return;
 
-        var chunks = await contentRepo.GetChunksAsync(fileId, ct);
-        string? content = chunks.Count > 0 ? string.Join("\n", chunks.Select(c => c.Content)) : null;
+        // Accumulate chunks (ordered by ChunkIndex) only up to MaxPromptChars instead of fetching and
+        // joining every chunk for the file first — chunk length varies with ContentChunker's
+        // whitespace-boundary trimming, so we can't just Take(N) a fixed chunk count up front.
+        var promptBuilder = new System.Text.StringBuilder();
+        await foreach (var chunk in contentRepo.StreamChunksAsync(fileId, ct))
+        {
+            if (promptBuilder.Length > 0)
+                promptBuilder.Append('\n');
+            promptBuilder.Append(chunk.Content);
+            if (promptBuilder.Length >= MaxPromptChars)
+                break;
+        }
+
+        string? content = promptBuilder.Length > 0 ? promptBuilder.ToString() : null;
         if (content is { Length: > MaxPromptChars })
             content = content[..MaxPromptChars];
 

@@ -11,7 +11,7 @@ namespace FileAnalysis.Infrastructure.Cleanup;
 /// Rejected, or Applied) is never overwritten by a later generation run, mirroring FileScanner's
 /// "alreadyAnalyzed" gate.
 /// </summary>
-public class CleanupSuggestionService(ICleanupSuggestionRepository repository, IFileRepository fileRepository, IOptions<CleanupOptions> options)
+public class CleanupSuggestionService(ICleanupSuggestionRepository repository, IOptions<CleanupOptions> options)
 {
     private readonly CleanupOptions _options = options.Value;
 
@@ -27,12 +27,41 @@ public class CleanupSuggestionService(ICleanupSuggestionRepository repository, I
         var minUsefulness = minUsefulnessOverride ?? _options.MinUsefulnessThreshold;
         var similarityThreshold = similarityThresholdOverride ?? _options.NearDuplicateThreshold;
 
+        var staleCutoff = DateTime.UtcNow.AddDays(-staleDays);
+
         int skipped = 0;
         var handled = new HashSet<Guid>();
+        // Defensive guard only — `handled` already guarantees TryUpsertAsync runs at most once per FileId
+        // per run (see the comment on TryUpsertAsync), which is what makes the up-front batch-read of
+        // existing-suggestion status below safe to use for the whole run without going stale. This set
+        // just makes that invariant fail loudly instead of silently double-writing if it's ever broken.
+        var writtenThisRun = new HashSet<Guid>();
         var createdItems = new List<CleanupCandidatePreview>();
 
         // Reason priority: ExactDuplicate > NearDuplicate > LowUsefulness > Stale.
         var exactDuplicates = await repository.FindExactDuplicateGroupsAsync(_options.MinDuplicateSizeBytes, ct);
+        var nearDuplicates = await repository.FindNearDuplicatesAsync(similarityThreshold, limitPerFile: 3, ct);
+        var candidateFiles = await repository.ListCandidateFilesAsync(pathFilter, minUsefulness, staleCutoff, ct);
+
+        // Batch-resolve everything the loops below would otherwise fetch one file at a time: display
+        // paths for duplicate keepers/candidates (candidateFiles and the exact-duplicate members already
+        // carry their own Path), and the existing-suggestion status for every FileId any loop might touch.
+        var idsNeedingPath = new HashSet<Guid>();
+        foreach (var dup in exactDuplicates)
+            idsNeedingPath.Add(dup.KeeperFileId);
+        foreach (var nearDup in nearDuplicates)
+        {
+            idsNeedingPath.Add(nearDup.FileId);
+            idsNeedingPath.Add(nearDup.CandidateFileId);
+        }
+        var pathsById = await repository.GetPathsByIdsAsync(idsNeedingPath, ct);
+
+        var allCandidateFileIds = exactDuplicates.Select(d => d.FileId)
+            .Concat(nearDuplicates.Select(n => n.FileId))
+            .Concat(candidateFiles.Select(f => f.FileId))
+            .ToHashSet();
+        var existingStatusByFileId = await repository.GetStatusesByFileIdsAsync(allCandidateFileIds, ct);
+
         foreach (var dup in exactDuplicates)
         {
             if (createdItems.Count >= _options.MaxCandidatesPerRun)
@@ -40,9 +69,10 @@ public class CleanupSuggestionService(ICleanupSuggestionRepository repository, I
             if (pathFilter is not null && !dup.Path.StartsWith(pathFilter, StringComparison.OrdinalIgnoreCase))
                 continue;
 
-            var keeperPath = (await fileRepository.GetByIdAsync(dup.KeeperFileId, ct))?.Path ?? dup.KeeperFileId.ToString();
+            var keeperPath = pathsById.GetValueOrDefault(dup.KeeperFileId, dup.KeeperFileId.ToString());
             var created = await TryUpsertAsync(
-                dup.FileId, dup.Path, CleanupReason.ExactDuplicate, $"Exact duplicate (identical content) of {keeperPath}", dup.KeeperFileId, dryRun, ct);
+                dup.FileId, dup.Path, CleanupReason.ExactDuplicate, $"Exact duplicate (identical content) of {keeperPath}",
+                dup.KeeperFileId, existingStatusByFileId, writtenThisRun, dryRun, ct);
             if (created is not null) createdItems.Add(created); else skipped++;
             handled.Add(dup.FileId);
             // The keeper is resolved for this run too — it must never also pick up a NearDuplicate/
@@ -50,7 +80,6 @@ public class CleanupSuggestionService(ICleanupSuggestionRepository repository, I
             handled.Add(dup.KeeperFileId);
         }
 
-        var nearDuplicates = await repository.FindNearDuplicatesAsync(similarityThreshold, limitPerFile: 3, ct);
         foreach (var (fileId, candidateFileId, similarity) in nearDuplicates)
         {
             if (createdItems.Count >= _options.MaxCandidatesPerRun)
@@ -58,20 +87,19 @@ public class CleanupSuggestionService(ICleanupSuggestionRepository repository, I
             if (handled.Contains(fileId))
                 continue;
 
-            var file = await fileRepository.GetByIdAsync(fileId, ct);
-            if (file is null)
-                continue;
-            if (pathFilter is not null && !file.Path.StartsWith(pathFilter, StringComparison.OrdinalIgnoreCase))
+            if (!pathsById.TryGetValue(fileId, out var filePath))
+                continue; // file no longer exists
+            if (pathFilter is not null && !filePath.StartsWith(pathFilter, StringComparison.OrdinalIgnoreCase))
                 continue;
 
-            var candidatePath = (await fileRepository.GetByIdAsync(candidateFileId, ct))?.Path ?? candidateFileId.ToString();
+            var candidatePath = pathsById.GetValueOrDefault(candidateFileId, candidateFileId.ToString());
             var created = await TryUpsertAsync(
-                fileId, file.Path, CleanupReason.NearDuplicate, $"{similarity:P0} similar to {candidatePath}", candidateFileId, dryRun, ct);
+                fileId, filePath, CleanupReason.NearDuplicate, $"{similarity:P0} similar to {candidatePath}",
+                candidateFileId, existingStatusByFileId, writtenThisRun, dryRun, ct);
             if (created is not null) createdItems.Add(created); else skipped++;
             handled.Add(fileId);
         }
 
-        var candidateFiles = await repository.ListCandidateFilesAsync(pathFilter, ct);
         foreach (var file in candidateFiles)
         {
             if (createdItems.Count >= _options.MaxCandidatesPerRun)
@@ -79,19 +107,22 @@ public class CleanupSuggestionService(ICleanupSuggestionRepository repository, I
             if (handled.Contains(file.FileId))
                 continue;
 
+            // ListCandidateFilesAsync already guarantees every row here satisfies
+            // (UsefulnessScore <= minUsefulness) OR (FileModifiedAt < staleCutoff); these checks now only
+            // decide which reason applies, not whether the file qualifies at all.
             if (file.UsefulnessScore is { } score && score <= minUsefulness)
             {
                 var created = await TryUpsertAsync(file.FileId, file.Path, CleanupReason.LowUsefulness,
-                    $"AI usefulness score {score}/10 (threshold {minUsefulness})", null, dryRun, ct);
+                    $"AI usefulness score {score}/10 (threshold {minUsefulness})", null, existingStatusByFileId, writtenThisRun, dryRun, ct);
                 if (created is not null) createdItems.Add(created); else skipped++;
                 handled.Add(file.FileId);
                 continue;
             }
 
-            if (file.FileModifiedAt is { } modified && modified < DateTime.UtcNow.AddDays(-staleDays))
+            if (file.FileModifiedAt is { } modified && modified < staleCutoff)
             {
                 var created = await TryUpsertAsync(file.FileId, file.Path, CleanupReason.Stale,
-                    $"Not modified since {modified:yyyy-MM-dd} ({staleDays}+ days)", null, dryRun, ct);
+                    $"Not modified since {modified:yyyy-MM-dd} ({staleDays}+ days)", null, existingStatusByFileId, writtenThisRun, dryRun, ct);
                 if (created is not null) createdItems.Add(created); else skipped++;
                 handled.Add(file.FileId);
             }
@@ -101,16 +132,24 @@ public class CleanupSuggestionService(ICleanupSuggestionRepository repository, I
     }
 
     /// <summary>Returns the preview of what would be (or was) created, or null if the file already has a
-    /// non-Pending (human-decided) suggestion that must not be clobbered.</summary>
+    /// non-Pending (human-decided) suggestion that must not be clobbered. <paramref name="existingStatusByFileId"/>
+    /// is a snapshot taken once at the start of the run — safe because the caller's `handled` set already
+    /// guarantees this is invoked at most once per FileId per run, so no write here can make another
+    /// candidate's snapshot entry stale mid-run.</summary>
     private async Task<CleanupCandidatePreview?> TryUpsertAsync(
-        Guid fileId, string path, CleanupReason reason, string details, Guid? duplicateOfFileId, bool dryRun, CancellationToken ct)
+        Guid fileId, string path, CleanupReason reason, string details, Guid? duplicateOfFileId,
+        IReadOnlyDictionary<Guid, CleanupStatus> existingStatusByFileId, HashSet<Guid> writtenThisRun, bool dryRun, CancellationToken ct)
     {
-        var existing = await repository.GetByFileIdAsync(fileId, ct);
-        if (existing is not null && existing.Status != CleanupStatus.Pending)
+        if (existingStatusByFileId.TryGetValue(fileId, out var existingStatus) && existingStatus != CleanupStatus.Pending)
             return null;
 
         if (!dryRun)
         {
+            if (!writtenThisRun.Add(fileId))
+                throw new InvalidOperationException(
+                    $"Cleanup suggestion for file {fileId} was about to be written twice in the same run — " +
+                    "this should be impossible given the `handled` gating in GenerateAsync.");
+
             await repository.UpsertAsync(new CleanupSuggestion
             {
                 FileId = fileId,

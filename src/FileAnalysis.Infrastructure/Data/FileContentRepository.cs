@@ -24,9 +24,17 @@ public class FileContentRepository(FileAnalysisDbContext db) : IFileContentRepos
 
     public async Task<IReadOnlyList<FileContent>> GetChunksAsync(Guid fileId, CancellationToken ct = default) =>
         await db.FileContents
+            .AsNoTracking()
             .Where(c => c.FileId == fileId)
             .OrderBy(c => c.ChunkIndex)
             .ToListAsync(ct);
+
+    public IAsyncEnumerable<FileContent> StreamChunksAsync(Guid fileId, CancellationToken ct = default) =>
+        db.FileContents
+            .AsNoTracking()
+            .Where(c => c.FileId == fileId)
+            .OrderBy(c => c.ChunkIndex)
+            .AsAsyncEnumerable();
 
     public async Task DeleteChunksAsync(Guid fileId, CancellationToken ct = default)
     {

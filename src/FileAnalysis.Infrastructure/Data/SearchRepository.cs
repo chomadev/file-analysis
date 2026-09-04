@@ -135,16 +135,34 @@ public class SearchRepository(FileAnalysisDbContext db) : ISearchRepository
 
     public async Task<IReadOnlyList<string>> ListTagsAsync(string? prefix = null, CancellationToken ct = default)
     {
-        var tagArrays = await db.FileAnalyses.AsNoTracking()
-            .Where(a => a.Tags.Length > 0)
-            .Select(a => a.Tags)
-            .ToListAsync(ct);
+        // Distinct-tag computation pushed into SQL via unnest() instead of loading every analyzed file's
+        // tag array and de-duplicating client-side. Tag ordering now follows DB collation rather than
+        // StringComparer.OrdinalIgnoreCase — acceptable since tags are LLM-generated and already instructed
+        // to be lowercase. DISTINCT is applied to lower(tag), not the raw value: the old
+        // .Distinct(StringComparer.OrdinalIgnoreCase) collapsed case-only variants (confirmed present in
+        // this index, e.g. "readme"/"README") — a byte-exact SELECT DISTINCT would silently start listing
+        // both instead of one, so we normalize case here rather than resurrect that as a bug.
+        // unnest() as a FROM-clause set-returning function, one row per tag, so the prefix filter below
+        // applies per-tag rather than per-file.
+        if (string.IsNullOrWhiteSpace(prefix))
+        {
+            const string sql = """
+                SELECT DISTINCT lower(t.tag) AS "Value"
+                FROM file_analyses fa, unnest(fa."Tags") AS t(tag)
+                ORDER BY lower(t.tag)
+                """;
+            return await db.Database.SqlQueryRaw<string>(sql).ToListAsync(ct);
+        }
 
-        var tags = tagArrays.SelectMany(t => t).Distinct(StringComparer.OrdinalIgnoreCase);
-        if (!string.IsNullOrWhiteSpace(prefix))
-            tags = tags.Where(t => t.StartsWith(prefix, StringComparison.OrdinalIgnoreCase));
-
-        return tags.OrderBy(t => t, StringComparer.OrdinalIgnoreCase).ToList();
+        // prefix is user input (CLI/MCP list_tags) — escape LIKE metacharacters before building the pattern.
+        var escapedPrefix = prefix.Replace("\\", "\\\\").Replace("%", "\\%").Replace("_", "\\_");
+        const string prefixSql = """
+            SELECT DISTINCT lower(t.tag) AS "Value"
+            FROM file_analyses fa, unnest(fa."Tags") AS t(tag)
+            WHERE t.tag ILIKE {0} ESCAPE '\'
+            ORDER BY lower(t.tag)
+            """;
+        return await db.Database.SqlQueryRaw<string>(prefixSql, escapedPrefix + "%").ToListAsync(ct);
     }
 
     private static SearchResult MapRow(SearchResultRow r) =>

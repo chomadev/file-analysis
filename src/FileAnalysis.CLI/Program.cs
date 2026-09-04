@@ -47,6 +47,11 @@ var reanalyzeOption = new Option<bool>("--reanalyze")
     Description = "Force AI re-analysis even for unchanged files that already have an analysis",
 };
 
+var rehashOption = new Option<bool>("--rehash")
+{
+    Description = "Always compute and compare MD5 for every file, even when size and modified time match the index (slower; catches content edits that preserve mtime)",
+};
+
 var skipSurveyOption = new Option<bool>("--skip-survey")
 {
     Description = "Skip the directory structure survey; fall back to the static --exclude patterns only",
@@ -70,6 +75,7 @@ scanCommand.Add(dryRunOption);
 scanCommand.Add(verboseOption);
 scanCommand.Add(skipAiOption);
 scanCommand.Add(reanalyzeOption);
+scanCommand.Add(rehashOption);
 scanCommand.Add(skipSurveyOption);
 scanCommand.Add(autoConfirmOption);
 scanCommand.Add(surveyOnlyOption);
@@ -82,6 +88,7 @@ scanCommand.SetAction(async (ParseResult parseResult, CancellationToken ct) =>
     var verbose      = parseResult.GetValue(verboseOption);
     var skipAi       = parseResult.GetValue(skipAiOption);
     var reanalyze    = parseResult.GetValue(reanalyzeOption);
+    var rehash       = parseResult.GetValue(rehashOption);
     var skipSurvey   = parseResult.GetValue(skipSurveyOption);
     var autoConfirm  = parseResult.GetValue(autoConfirmOption);
     var surveyOnly   = parseResult.GetValue(surveyOnlyOption);
@@ -141,7 +148,7 @@ scanCommand.SetAction(async (ParseResult parseResult, CancellationToken ct) =>
 
     using var scanScope = sp.CreateScope();
     var scanner = scanScope.ServiceProvider.GetRequiredService<FileScanner>();
-    await scanner.ScanAsync(path.FullName, dryRun, skipAi, reanalyze, excludedPaths, ct);
+    await scanner.ScanAsync(path.FullName, dryRun, skipAi, reanalyze, excludedPaths, rehash, ct);
 
     queue.Writer.TryComplete();
     await processingTask;

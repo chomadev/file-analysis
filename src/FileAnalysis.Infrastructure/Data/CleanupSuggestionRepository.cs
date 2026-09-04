@@ -54,6 +54,18 @@ public class CleanupSuggestionRepository(FileAnalysisDbContext db) : ICleanupSug
         return result;
     }
 
+    // NOTE ON A REVERTED OPTIMIZATION: this was rewritten to a single CROSS JOIN LATERAL query (one round
+    // trip for the whole table instead of one SqlQueryRaw per embedded file) and then reverted back to the
+    // per-file loop below after EXPLAIN ANALYZE against the real dev DB (14,668 files / 1,442 embeddings)
+    // showed the lateral subplan does NOT use idx_analyses_embedding — it falls back to a Seq Scan +
+    // Hash Join + top-N sort, same as this per-file form does today. The index is only reachable by the
+    // planner when the ORDER BY ... LIMIT sits directly on file_analyses; joining in files for the
+    // f2."Extension" = f1."Extension" filter (in either the lateral or this per-file form) defeats it. A
+    // server-side loop of 1,442 individual per-file statements (same shape as below, no client round
+    // trips) measured ~290ms total; the lateral form measured ~2.4-2.7s for the same result set — i.e. the
+    // lateral rewrite was not a win here even ignoring the extra round trips it was meant to save. Revisit
+    // if the extension filter is ever denormalized onto file_analyses itself (would let both the lateral
+    // and this form use the index), per the task's "do not ship a change that's silently worse" gate.
     public async Task<IReadOnlyList<(Guid FileId, Guid CandidateFileId, double Similarity)>> FindNearDuplicatesAsync(
         double threshold, int limitPerFile, CancellationToken ct = default)
     {
@@ -101,11 +113,17 @@ public class CleanupSuggestionRepository(FileAnalysisDbContext db) : ICleanupSug
     }
 
     public async Task<IReadOnlyList<(Guid FileId, string Path, int? UsefulnessScore, DateTime? FileModifiedAt)>> ListCandidateFilesAsync(
-        string? pathPrefix, CancellationToken ct = default)
+        string? pathPrefix, int minUsefulness, DateTime staleCutoff, CancellationToken ct = default)
     {
         var query = db.Files.AsNoTracking().AsQueryable();
         if (!string.IsNullOrWhiteSpace(pathPrefix))
             query = query.Where(f => f.Path.StartsWith(pathPrefix));
+
+        // Push the LowUsefulness/Stale threshold check into the query so we only ever pull rows that can
+        // actually produce a suggestion, instead of loading every indexed file and filtering in C#.
+        query = query.Where(f =>
+            (f.Analysis != null && f.Analysis.UsefulnessScore <= minUsefulness) ||
+            (f.FileModifiedAt != null && f.FileModifiedAt < staleCutoff));
 
         var rows = await query
             .Select(f => new
@@ -120,24 +138,56 @@ public class CleanupSuggestionRepository(FileAnalysisDbContext db) : ICleanupSug
         return rows.Select(r => (r.Id, r.Path, r.UsefulnessScore, r.FileModifiedAt)).ToList();
     }
 
+    public async Task<IReadOnlyDictionary<Guid, string>> GetPathsByIdsAsync(IReadOnlyCollection<Guid> fileIds, CancellationToken ct = default)
+    {
+        if (fileIds.Count == 0)
+            return new Dictionary<Guid, string>();
+
+        return await db.Files.AsNoTracking()
+            .Where(f => fileIds.Contains(f.Id))
+            .Select(f => new { f.Id, f.Path })
+            .ToDictionaryAsync(f => f.Id, f => f.Path, ct);
+    }
+
+    public async Task<IReadOnlyDictionary<Guid, CleanupStatus>> GetStatusesByFileIdsAsync(IReadOnlyCollection<Guid> fileIds, CancellationToken ct = default)
+    {
+        if (fileIds.Count == 0)
+            return new Dictionary<Guid, CleanupStatus>();
+
+        return await db.CleanupSuggestions.AsNoTracking()
+            .Where(s => fileIds.Contains(s.FileId))
+            .Select(s => new { s.FileId, s.Status })
+            .ToDictionaryAsync(s => s.FileId, s => s.Status, ct);
+    }
+
     public async Task<CleanupSuggestion?> GetByFileIdAsync(Guid fileId, CancellationToken ct = default) =>
-        await db.CleanupSuggestions.FirstOrDefaultAsync(s => s.FileId == fileId, ct);
+        await db.CleanupSuggestions.AsNoTracking().FirstOrDefaultAsync(s => s.FileId == fileId, ct);
 
     public async Task<CleanupSuggestion?> GetByIdOrPrefixAsync(string idOrPrefix, CancellationToken ct = default)
     {
         if (Guid.TryParse(idOrPrefix, out var exactId))
-            return await db.CleanupSuggestions.FirstOrDefaultAsync(s => s.Id == exactId, ct);
+            return await db.CleanupSuggestions.AsNoTracking().FirstOrDefaultAsync(s => s.Id == exactId, ct);
 
         var prefix = idOrPrefix.ToLowerInvariant();
-        var ids = await db.CleanupSuggestions.AsNoTracking().Select(s => s.Id).ToListAsync(ct);
-        var matches = ids.Where(id => id.ToString("N").StartsWith(prefix, StringComparison.Ordinal)).ToList();
+
+        // Server-side prefix match against the undashed hex form — what's actually shown to users
+        // (Id.ToString("N")[..8]). The old in-memory scan loaded every suggestion ID up front and,
+        // being a plain StartsWith against ToString("N"), matched fine for that display case; this
+        // does the same match in SQL so it never has to materialize every row, and works for any
+        // prefix length instead of relying on client-side string handling.
+        const string sql = """
+            SELECT "Id" FROM cleanup_suggestions WHERE REPLACE("Id"::text, '-', '') LIKE {0}
+            """;
+        var matches = await db.Database
+            .SqlQueryRaw<Guid>(sql, prefix + "%")
+            .ToListAsync(ct);
 
         if (matches.Count == 0)
             return null;
         if (matches.Count > 1)
             throw new InvalidOperationException($"ID prefix '{idOrPrefix}' matches {matches.Count} suggestions — use more characters.");
 
-        return await db.CleanupSuggestions.FirstOrDefaultAsync(s => s.Id == matches[0], ct);
+        return await db.CleanupSuggestions.AsNoTracking().FirstOrDefaultAsync(s => s.Id == matches[0], ct);
     }
 
     public async Task UpsertAsync(CleanupSuggestion suggestion, CancellationToken ct = default)

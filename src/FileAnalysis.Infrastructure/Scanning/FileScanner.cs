@@ -20,12 +20,22 @@ public class FileScanner(
 {
     private readonly ScannerOptions _options = options.Value;
 
-    /// <summary>Scans <paramref name="rootPath"/> and upserts file records.</summary>
+    /// <summary>Scans <paramref name="rootPath"/> and upserts file records. By default, a file whose size
+    /// and mtime both match its last-indexed values is treated as unchanged without re-hashing it — pass
+    /// <paramref name="rehash"/> to force the old always-verify-by-MD5 behavior (needed to catch a content
+    /// edit that preserves mtime).</summary>
     public async Task<ScanSummary> ScanAsync(string rootPath, bool dryRun = false, bool skipAi = false, bool reanalyze = false,
-        IReadOnlySet<string>? excludedPaths = null, CancellationToken ct = default)
+        IReadOnlySet<string>? excludedPaths = null, bool rehash = false, CancellationToken ct = default)
     {
         var started = DateTime.UtcNow;
         int newCount = 0, updated = 0, unchanged = 0, skipped = 0, errors = 0;
+
+        // Bulk-preload existing file metadata for everything under this root in one round trip instead of
+        // a per-file GetByPathAsync query. AsNoTracking projection only — see GetScanMetadataAsync's doc
+        // comment for why tracked entities would make later SaveChanges calls go quadratic.
+        var existingByPath = dryRun
+            ? new Dictionary<string, FileScanMetadata>(StringComparer.Ordinal)
+            : await repository.GetScanMetadataAsync(rootPath, ct);
 
         foreach (var filePath in EnumerateFiles(rootPath, excludedPaths))
         {
@@ -40,13 +50,34 @@ public class FileScanner(
                     continue;
                 }
 
-                var hash = ComputeMd5(filePath);
-                var existing = dryRun ? null : await repository.GetByPathAsync(filePath, ct);
+                existingByPath.TryGetValue(filePath, out var meta);
+
+                // Fast path: size and mtime unchanged since last index means we skip reading (and hashing)
+                // up to MaxFileSizeBytes off disk for a file we already know is unchanged. This changes
+                // default change-detection semantics — a content edit that preserves mtime would be missed —
+                // so --rehash opts back into always computing and comparing MD5.
+                // Tolerance (not exact equality) on the mtime comparison: Postgres "timestamp" has
+                // microsecond resolution while NTFS mtimes carry 100ns ticks, so a value round-tripped
+                // through the DB can differ from the freshly-read FileInfo value by a sub-microsecond
+                // rounding error even when the file itself hasn't changed.
+                var mtimeMatch = !rehash && meta?.FileModifiedAt is { } storedMtime
+                    && meta.SizeBytes == info.Length
+                    && (info.LastWriteTimeUtc - storedMtime).Duration() < TimeSpan.FromMilliseconds(1);
+
+                string hash;
+                bool isUnchanged;
+                if (mtimeMatch)
+                {
+                    hash = meta!.Md5Hash ?? "";
+                    isUnchanged = true;
+                }
+                else
+                {
+                    hash = ComputeMd5(filePath);
+                    isUnchanged = meta is not null && meta.Md5Hash == hash && meta.SizeBytes == info.Length;
+                }
 
                 var mimeType = MimeTypeDetector.Detect(filePath);
-                var isUnchanged = existing is not null
-                    && existing.Md5Hash == hash
-                    && existing.SizeBytes == info.Length;
 
                 if (isUnchanged)
                 {
@@ -54,14 +85,13 @@ public class FileScanner(
                     // Files with no extractable content (e.g. .3mf) always report zero chunks, so we also
                     // gate on "already analyzed at least once" — otherwise a content-less file would
                     // re-extract and re-enqueue for AI analysis on every single scan forever.
-                    var hasContent = !dryRun
-                        && await contentRepo.GetChunksAsync(existing!.Id, ct) is { Count: > 0 };
-                    var alreadyAnalyzed = existing!.Analysis is not null;
+                    var hasContent = meta!.HasChunks;
+                    var alreadyAnalyzed = meta.HasAnalysis;
 
                     if (hasContent || alreadyAnalyzed)
                     {
                         if (!dryRun && !skipAi && (reanalyze || !alreadyAnalyzed))
-                            EnqueueAnalysis(existing!.Id);
+                            EnqueueAnalysis(meta.Id);
 
                         reporter.ReportProgress(filePath, ScanStatus.Unchanged);
                         unchanged++;
@@ -70,9 +100,9 @@ public class FileScanner(
 
                     if (!dryRun)
                     {
-                        await ExtractAndStoreAsync(filePath, mimeType, existing!.Id, ct);
+                        await ExtractAndStoreAsync(filePath, mimeType, meta.Id, ct);
                         if (!skipAi)
-                            EnqueueAnalysis(existing!.Id);
+                            EnqueueAnalysis(meta.Id);
                     }
 
                     reporter.ReportProgress(filePath, ScanStatus.Unchanged);
@@ -80,23 +110,22 @@ public class FileScanner(
                     continue;
                 }
 
-                var isNew = existing is null;
-                var record = existing ?? new IndexedFile
+                var isNew = meta is null;
+                var record = new IndexedFile
                 {
                     Path = filePath,
                     Name = info.Name,
+                    Extension = info.Extension.ToLowerInvariant(),
+                    MimeType = mimeType,
+                    SizeBytes = info.Length,
+                    Md5Hash = hash,
+                    FileCreatedAt = info.CreationTimeUtc,
+                    FileModifiedAt = info.LastWriteTimeUtc,
+                    LastScannedAt = DateTime.UtcNow,
                 };
-
-                record.Name = info.Name;
-                record.Extension = info.Extension.ToLowerInvariant();
-                record.MimeType = mimeType;
-                record.SizeBytes = info.Length;
-                record.Md5Hash = hash;
-                record.FileCreatedAt = info.CreationTimeUtc;
-                record.FileModifiedAt = info.LastWriteTimeUtc;
-                record.LastScannedAt = DateTime.UtcNow;
                 if (isNew) record.IndexedAt = DateTime.UtcNow;
 
+                // Written per-file (not batched) so a failure processing file N never affects files 1..N-1.
                 IndexedFile persisted = record;
                 if (!dryRun)
                 {

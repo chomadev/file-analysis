@@ -11,7 +11,7 @@ public class FileRepository(FileAnalysisDbContext db) : IFileRepository
         await db.Files.Include(f => f.Analysis).FirstOrDefaultAsync(f => f.Path == path, ct);
 
     public async Task<IndexedFile?> GetByIdAsync(Guid id, CancellationToken ct = default) =>
-        await db.Files.FirstOrDefaultAsync(f => f.Id == id, ct);
+        await db.Files.AsNoTracking().FirstOrDefaultAsync(f => f.Id == id, ct);
 
     public async Task<IndexedFile> UpsertAsync(IndexedFile file, CancellationToken ct = default)
     {
@@ -37,4 +37,26 @@ public class FileRepository(FileAnalysisDbContext db) : IFileRepository
 
     public async Task<IReadOnlyList<IndexedFile>> GetAllAsync(CancellationToken ct = default) =>
         await db.Files.ToListAsync(ct);
+
+    public async Task<IReadOnlyDictionary<string, FileScanMetadata>> GetScanMetadataAsync(string rootPathPrefix, CancellationToken ct = default)
+    {
+        var rows = await db.Files.AsNoTracking()
+            .Where(f => f.Path.StartsWith(rootPathPrefix))
+            .Select(f => new
+            {
+                f.Path,
+                f.Id,
+                f.Md5Hash,
+                f.SizeBytes,
+                f.FileModifiedAt,
+                HasChunks = f.Contents.Any(),
+                HasAnalysis = f.Analysis != null,
+            })
+            .ToListAsync(ct);
+
+        return rows.ToDictionary(
+            r => r.Path,
+            r => new FileScanMetadata(r.Id, r.Md5Hash, r.SizeBytes, r.FileModifiedAt, r.HasChunks, r.HasAnalysis),
+            StringComparer.Ordinal);
+    }
 }

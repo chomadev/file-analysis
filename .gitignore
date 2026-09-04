@@ -1,0 +1,12 @@
+bin/
+obj/
+.vs/
+*.user
+*.suo
+.idea/
+*.swp
+*.DS_Store
+appsettings.Development.json
+
+# Cleanup quarantine (holds moved user files, not project code)
+quarantine/

@@ -108,6 +108,26 @@ Exposed tools: `search_files`, `get_file_analysis`, `find_similar`, `list_catego
 Only stdio transport is implemented (what Claude Desktop uses). HTTP/SSE transport for a remote-hosted
 server was listed as optional in the plan and has not been built.
 
+## Published binaries (plug-and-play)
+
+Self-contained, single-file `win-x64` builds (no .NET SDK/runtime required to run them) live at:
+
+```
+C:\tools\file-analysis\cli\FileAnalysis.CLI.exe
+C:\tools\file-analysis\mcp\FileAnalysis.MCP.exe
+```
+
+Rebuild after any code change:
+
+```
+dotnet publish src/FileAnalysis.CLI -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o C:\tools\file-analysis\cli
+dotnet publish src/FileAnalysis.MCP -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o C:\tools\file-analysis\mcp
+```
+
+A Claude Code skill wrapping the published CLI (and documenting MCP registration) is installed at
+`~/.claude/skills/file-analysis/SKILL.md` — Claude picks it up automatically for tasks like
+"clean up this old folder" or "find duplicates in X" without needing this repo open.
+
 ## Terminal chat with a local model (no Open WebUI needed)
 
 For talking to a local Ollama model (with native tool-calling, e.g. `qwen3:14b`) wired directly to the
